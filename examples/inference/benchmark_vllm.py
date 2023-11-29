@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
+from contextlib import nullcontext
 
 
 def main(args: argparse.Namespace):
@@ -48,14 +49,36 @@ def main(args: argparse.Namespace):
         if profile:
             torch.cuda.cudart().cudaProfilerStop()
         return latency
-
-    print("Warming up...")
-    run_to_completion(profile=False)
-
-    # Benchmark.
+    
+    N_WARMUP_STEPS = 2
+    
+    ctx = (
+        torch.profiler.profile(
+            record_shapes=True,
+            with_stack=True,
+            with_modules=True,
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=0, warmup=N_WARMUP_STEPS, active=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler("./vllm_tb_log_" + str(args.batch_size) + "_" + str(args.input_len)),
+        )
+        if args.profile
+        else nullcontext()
+    )
+    
     latencies = []
-    for _ in tqdm(range(args.num_iters), desc="Profiling iterations"):
+    
+    with ctx:
+        for _ in range(N_WARMUP_STEPS):
+            run_to_completion(profile=False)
+            if args.profile:
+                ctx.step()
         latencies.append(run_to_completion(profile=False))
+        if args.profile:
+            ctx.step()
+
     print(f"Avg latency: {np.mean(latencies)} seconds")
     print(f"Avg throughput: {args.batch_size*args.output_len/np.mean(latencies)} tokens/s")
 
@@ -85,5 +108,6 @@ if __name__ == "__main__":
         "for FP32 and FP16 models, and BF16 precision "
         "for BF16 models.",
     )
+    parser.add_argument("--profile", default=False, action="store_true", help="enable torch profiler")
     args = parser.parse_args()
     main(args)
